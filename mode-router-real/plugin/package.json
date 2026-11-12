@@ -1,0 +1,11 @@
+{
+  "name": "dsh-plugin-switch-mode",
+  "version": "0.1.0",
+  "description": "Herramienta switch_mode para DSH: deja la peticion de cambio de motor al supervisor",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  }
+}

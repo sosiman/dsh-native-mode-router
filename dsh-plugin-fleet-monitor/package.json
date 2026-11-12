@@ -1,0 +1,20 @@
+{
+  "name": "dsh-plugin-fleet-monitor",
+  "version": "1.2.0",
+  "description": "Boton en el frontend de DSH que abre un monitor de terminal en vivo con la flota de proyectos y agentes",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node tests/test-host.mjs && node tests/test-wake.mjs && python3 tests/test-dsh-top.py"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

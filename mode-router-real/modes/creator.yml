@@ -1,0 +1,5 @@
+# Motor creator: las herramientas de Cordis YA están en la composición
+# (cordis-host-runner line 484, cordis-inspect-providers line 486).
+# No se inserta 'tool-cordis': ya vive dentro de preset-cordis (line 1239)
+# e insertarlo arriba lo cargaría dos veces.
+[]

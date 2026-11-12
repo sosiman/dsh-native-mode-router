@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""dsh-empty — localiza (y opcionalmente borra) sesiones de DSH creadas pero vacias.
+
+Una sesion vacia es un fichero de sesion que solo tiene la cabecera y los ajustes
+iniciales, sin ningun mensaje: aparece al pulsar "Nueva sesion" y no escribir nada.
+DSH no las muestra como conversaciones, pero ocupan disco y ensucian los monitores.
+
+Uso:
+    dsh-empty                 lista las sesiones vacias
+    dsh-empty --delete        las mueve a ~/.dsh/backups/empty-sessions-<fecha>/
+    dsh-empty --json          salida JSON (para scripts)
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+DSH_HOME = os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+SESSIONS = os.path.join(DSH_HOME, "sessions")
+BACKUPS = os.path.join(DSH_HOME, "backups")
+
+MARKERS = (
+    b'"type":"turn/start"',
+    b'"type":"user/message"',
+    b'"type":"agent/inbox',
+    b'"type":"system/message"',
+)
+
+
+def find_empty():
+    found = []
+    for path in glob.glob(os.path.join(SESSIONS, "*", "*", "session.v*.jsonl.zstd")):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size >= 8192:
+            continue
+        raw = subprocess.run(["zstdcat", path], capture_output=True).stdout
+        if any(m in raw for m in MARKERS):
+            continue
+        header = {}
+        try:
+            header = json.loads(raw.split(b"\n")[0])
+        except Exception:
+            pass
+        session_dir = os.path.dirname(path)
+        cwd = header.get("cwd") or ""
+        found.append({
+            "id": header.get("id") or os.path.basename(session_dir),
+            "cwd": cwd,
+            "project": os.path.basename(cwd.rstrip("/")) if cwd else "?",
+            "created": header.get("createdAt"),
+            "mtime": os.path.getmtime(path),
+            "bytes": size,
+            "dir": session_dir,
+            "file": path,
+        })
+    found.sort(key=lambda x: -x["mtime"])
+    return found
+
+
+def main():
+    delete = "--delete" in sys.argv
+    as_json = "--json" in sys.argv
+    empty = find_empty()
+
+    if as_json:
+        print(json.dumps([{k: v for k, v in e.items()} for e in empty], indent=2, ensure_ascii=False))
+        return 0
+
+    if not empty:
+        print("No hay sesiones vacias.")
+        return 0
+
+    print("Sesiones vacias (sin ningun mensaje): %d\n" % len(empty))
+    print("%-17s %9s  %-28s %-14s %s" % ("ULTIMO CAMBIO", "TAMANO", "PROYECTO", "SESION", "CARPETA"))
+    print("%-17s %9s  %-28s %-14s %s" % ("-" * 17, "-" * 9, "-" * 28, "-" * 14, "-" * 40))
+    for e in empty:
+        print("%-17s %8.1fK  %-28s %-14s %s" % (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(e["mtime"])),
+            e["bytes"] / 1024.0,
+            e["project"][:28],
+            str(e["id"]).replace("session-", "")[:12],
+            e["dir"].replace(SESSIONS + "/", ""),
+        ))
+    total = sum(e["bytes"] for e in empty)
+    print("\nTotal: %.1f KB en %d carpetas." % (total / 1024.0, len(empty)))
+
+    if not delete:
+        print("\nPara borrarlas (con copia de seguridad): dsh-empty --delete")
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUPS, "empty-sessions-%s" % stamp)
+    os.makedirs(dest, exist_ok=True)
+    moved = 0
+    for e in empty:
+        try:
+            shutil.move(e["dir"], os.path.join(dest, os.path.basename(e["dir"])))
+            moved += 1
+        except Exception as error:
+            print("  no pude mover %s: %s" % (e["dir"], error))
+    print("\nMovidas %d a %s" % (moved, dest))
+    print("DSH dejara de listarlas al reiniciar el proceso (ya avisa de 'session header is missing').")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

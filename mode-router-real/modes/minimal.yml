@@ -1,0 +1,19 @@
+# Motor mínimo: shell + lectura. Las herramientas de escritura y orquestación fuera.
+- id: tool-fs
+  config:
+    read: true
+    readImage: true
+    write: false
+    edit: false
+- id: skill-filesystem
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-web-search
+  disabled: true
+- id: tool-web-fetch
+  disabled: true

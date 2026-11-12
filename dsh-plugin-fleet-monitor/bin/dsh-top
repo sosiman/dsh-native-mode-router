@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dsh-top v1.2 — monitor de flota DSH en vivo.
+
+Lee la CABECERA de cada sesion (session.v3/v4 + futuras) sin descomprimir el
+log completo, la cachea por (mtime, size) y la refresca cada segundo.
+
+Columnas: PROYECTO | AGENTE/ID | MODO/PRESET | ESTADO | ACTIVIDAD
+
+Teclas:
+    p s t m c   conmutar motor global (ptc / standard / team / minimal / creator)
+    f           filtro: todas <-> solo recientes (24 h)
+    n / espacio pagina siguiente      b  pagina anterior
+    r           recargar cabeceras    q  salir
+"""
+
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+import unicodedata
+
+HOME = os.path.expanduser("~")
+DSH_HOME = os.environ.get("DSH_HOME") or os.path.join(HOME, ".dsh")
+SESSIONS_DIR = os.path.join(DSH_HOME, "sessions")
+STATE_DIR = os.environ.get("DSH_FLEET_STATE_DIR") or os.path.join(DSH_HOME, "mode-router")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+REQ_FILE = os.path.join(STATE_DIR, "request.json")
+PID_FILE = os.environ.get("DSH_FLEET_PID_FILE") or "/tmp/dsh-fleet-monitor.pid"
+URL_FILE = os.path.join(STATE_DIR, "last-url.txt")
+
+REFRESH = 1.0
+LIVE_SECONDS = 90
+ACTIVE_SECONDS = 3600
+TODAY_SECONDS = 86400
+REST_SECONDS = 86400 * 7
+
+MODES = ("standard", "ptc", "team", "minimal", "creator")
+MODE_LABEL = {
+    "standard": "STANDARD",
+    "ptc": "PTC",
+    "team": "TEAM",
+    "minimal": "MINIMAL",
+    "creator": "CREATOR",
+    "cordis": "CREATOR",  # nombre antiguo del preset
+}
+MODE_ICON = {
+    "standard": "\u26a1",
+    "ptc": "\U0001f9e9",
+    "team": "\U0001f465",
+    "minimal": "\U0001f41a",
+    "creator": "\U0001f6e0\ufe0f",
+    "cordis": "\U0001f6e0\ufe0f",
+}
+MODE_COLOR = {
+    "standard": "\033[1;36m",
+    "ptc": "\033[1;35m",
+    "team": "\033[1;34m",
+    "minimal": "\033[1;33m",
+    "creator": "\033[1;32m",
+    "cordis": "\033[1;32m",
+}
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+
+# --------------------------------------------------------------------------
+# utilidades de ancho (los emoji ocupan 2 y los selectores de variante 0)
+# --------------------------------------------------------------------------
+def vwidth(text):
+    text = ANSI_RE.sub("", text)
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        if unicodedata.category(ch) in ("Mn", "Cf"):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def fit(text, width, align="left"):
+    """Recorta/rellena a un ancho VISIBLE exacto."""
+    if vwidth(text) > width:
+        out = ""
+        for ch in text:
+            if vwidth(out + ch) > width - 1:
+                break
+            out += ch
+        text = out + "\u2026"
+    pad = width - vwidth(text)
+    if align == "right":
+        return " " * pad + text
+    if align == "center":
+        left = pad // 2
+        return " " * left + text + " " * (pad - left)
+    return text + " " * pad
+
+
+def ago_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+# --------------------------------------------------------------------------
+# lectura de metadatos
+# --------------------------------------------------------------------------
+def read_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return fallback
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def engine_state():
+    state = read_json(STATE_FILE, {})
+    mode = str(state.get("mode") or "standard").lower()
+    if mode == "cordis":
+        mode = "creator"
+    pid = state.get("pid")
+    sid = str(state.get("sessionId") or "")
+    if sid.startswith("session-"):
+        sid = sid[8:]
+    at_ms = 0
+    try:
+        import datetime
+        at_ms = int(datetime.datetime.fromisoformat(str(state.get("at")).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        at_ms = 0
+    return {
+        "mode": mode,
+        "pid": pid,
+        "sessionId": sid,
+        "alive": pid_alive(pid),
+        "at": state.get("at"),
+        "atMs": at_ms,
+    }
+
+
+_header_cache = {}
+_sel_cache = {}
+
+
+def last_selected_preset(path, mtime, size):
+    """Ultimo `agent-preset/selected` del log de la sesion. Es el modo REAL de esa
+    sesion aunque se haya cambiado despues de crearla."""
+    key = (int(mtime), int(size))
+    cached = _sel_cache.get(path)
+    if cached is not None and cached["key"] == key:
+        return cached["value"]
+    value = None
+    try:
+        out = subprocess.run(
+            ["bash", "-c", 'zstdcat "$1" | tail -c 1000000', "_", path],
+            capture_output=True, timeout=10).stdout
+        idx = out.rfind(b'"agent-preset/selected"')
+        if idx >= 0:
+            import re as _re
+            chunk = out[idx:idx + 600]
+            match = _re.search(rb'"agentPreset"\s*:\s*"([a-z]+)"', chunk)
+            if match:
+                value = match.group(1).decode("ascii", "ignore")
+            line_start = out.rfind(b"\n", 0, idx) + 1
+            line_end = out.find(b"\n", idx)
+            try:
+                event = json.loads(out[line_start:line_end if line_end > 0 else idx + 600])
+                value = {"preset": value, "time": int(event.get("time") or 0)}
+            except Exception:
+                pass
+    except Exception:
+        value = None
+    _sel_cache[path] = {"key": key, "value": value}
+    return value
+
+_ws_cache = {"key": None, "ids": None, "titles": None}
+_stats = {"empty": 0}
+
+
+def workspace_sessions():
+    """Ids de sesion que cuelgan de un workspace ACTIVO (global.workspaceIds).
+
+    Al borrar un proyecto en DSH, sus ficheros de sesion siguen en disco pero
+    dejan de estar en el workspace: esas sesiones son huerfanas y el monitor
+    no debe seguir pintandolas como si el proyecto existiera.
+    """
+    path = os.path.join(DSH_HOME, "storages", "workspace.json")
+    try:
+        stat = os.stat(path)
+        key = (stat.st_mtime, stat.st_size)
+    except OSError:
+        return None  # sin registro: no filtramos nada
+    if _ws_cache["key"] == key:
+        return _ws_cache["ids"]
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        active = set(str(x) for x in (data.get("global", {}).get("workspaceIds") or []))
+        ids = set()
+        for wid, info in (data.get("tables", {}).get("workspaces") or {}).items():
+            if active and wid not in active:
+                continue
+            for sid in info.get("sessionIds") or []:
+                sid = str(sid)
+                ids.add(sid[8:] if sid.startswith("session-") else sid)
+    except Exception:
+        return None
+    _ws_cache["key"] = key
+    _ws_cache["ids"] = ids
+    return ids
+
+
+def workspace_titles():
+    """Ruta -> titulo del proyecto tal y como se ve en la web de DSH."""
+    path = os.path.join(DSH_HOME, "storages", "workspace.json")
+    try:
+        stat = os.stat(path)
+        key = (stat.st_mtime, stat.st_size)
+        if _ws_cache["key"] == key and _ws_cache["titles"] is not None:
+            return _ws_cache["titles"]
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        titles = {}
+        for wid, info in (data.get("tables", {}).get("workspaces") or {}).items():
+            ws_path = info.get("path")
+            if ws_path and info.get("title"):
+                titles[ws_path] = info["title"]
+        _ws_cache["titles"] = titles
+        return titles
+    except Exception:
+        return {}
+
+
+def session_files():
+    patterns = ("session.v*.jsonl.zstd", "session.v*.zstd")
+    seen = []
+    for pattern in patterns:
+        seen.extend(glob.glob(os.path.join(SESSIONS_DIR, "*", "*", pattern)))
+    return sorted(set(seen))
+
+
+def read_header(path):
+    try:
+        proc = subprocess.Popen(
+            ["zstdcat", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            line = proc.stdout.readline()
+        finally:
+            proc.kill()
+            proc.stdout.close()
+        return json.loads(line.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def project_name(cwd, fallback):
+    if cwd:
+        clean = cwd.rstrip("/")
+        if clean == HOME:
+            return "~ (home)"
+        name = os.path.basename(clean) or clean
+        return name
+    return fallback
+
+
+def is_empty_log(path, size):
+    """Sesion creada pero nunca usada: solo cabecera y ajustes, sin turnos."""
+    if size >= 8192:
+        return False
+    try:
+        raw = subprocess.run(["zstdcat", path], capture_output=True, timeout=5).stdout
+    except Exception:
+        return False
+    return not any(marker in raw for marker in (
+        b'"type":"turn/start"', b'"type":"user/message"',
+        b'"type":"agent/inbox', b'"type":"system/message"',
+    ))
+
+
+def collect_sessions(force=False):
+    """Devuelve la lista de sesiones, releyendo solo las cabeceras cambiadas."""
+    now = time.time()
+    rows = []
+    alive_paths = set()
+    _stats["empty"] = 0
+
+    for path in session_files():
+        alive_paths.add(path)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if is_empty_log(path, stat.st_size):
+            _stats["empty"] += 1
+            continue
+        key = (stat.st_mtime, stat.st_size)
+        cached = _header_cache.get(path)
+        if force or cached is None or cached.get("key") != key:
+            header = read_header(path)
+            if header is None:
+                continue
+            sid = str(header.get("id") or os.path.basename(os.path.dirname(path)))
+            if sid.startswith("session-"):
+                sid = sid[8:]
+            preset = str(header.get("agentPreset") or "standard").lower()
+            if preset not in MODE_LABEL:
+                preset = "standard"
+            preset_time = 0
+            if (now - stat.st_mtime) < 86400:
+                selected = last_selected_preset(path, stat.st_mtime, stat.st_size)
+                if isinstance(selected, dict) and selected.get("preset") in MODE_LABEL:
+                    preset = selected["preset"]
+                    preset_time = int(selected.get("time") or 0)
+                elif selected in MODE_LABEL:
+                    preset = selected
+            cwd = header.get("cwd") or ""
+            dir_key = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            segments = [seg for seg in dir_key.strip("-").split("-") if seg]
+            rows_dir = (segments[-1] if segments else "root").replace("~0020", " ")
+            info = {
+                "id": sid,
+                "preset": preset,
+                "project": project_name(cwd, rows_dir),
+                "cwd": cwd,
+                "created": header.get("createdAt"),
+                "depth": int(header.get("delegationDepth") or 0),
+                "parent": header.get("parentSession") or None,
+            }
+            _header_cache[path] = {"key": key, "info": info, "presetTime": preset_time}
+            cached = _header_cache[path]
+
+        info = cached["info"]
+        age = now - stat.st_mtime
+        rows.append({
+            "id": info["id"],
+            "preset": info["preset"],
+            "presetTime": cached.get("presetTime", 0),
+            "project": info["project"],
+            "cwd": info["cwd"],
+            "depth": info["depth"],
+            "parent": info["parent"],
+            "age": age,
+            "mtime": stat.st_mtime,
+            "version": os.path.basename(path).split(".")[1],
+        })
+
+    for path in list(_header_cache):
+        if path not in alive_paths:
+            del _header_cache[path]
+
+    # una sesion puede existir como v3 y como v4: manda la copia mas reciente
+    unique = {}
+    for row in rows:
+        current = unique.get(row["id"])
+        if current is None or row["mtime"] > current["mtime"]:
+            unique[row["id"]] = row
+    return list(unique.values())
+
+
+def status_of(age):
+    if age < LIVE_SECONDS:
+        return "live"
+    if age < ACTIVE_SECONDS:
+        return "active"
+    if age < TODAY_SECONDS:
+        return "today"
+    if age < REST_SECONDS:
+        return "rest"
+    return "idle"
+
+
+STATUS_RENDER = {
+    "live": ("\033[1;32m", "\U0001f7e2 LIVE"),
+    "active": ("\033[1;32m", "\U0001f7e2 ACTIVE"),
+    "today": ("\033[1;33m", "\U0001f7e1 TODAY"),
+    "rest": ("\033[0;37m", "\u26aa resting"),
+    "idle": ("\033[0;90m", "\U0001f4a4 inactive"),
+}
+STATUS_RANK = {"live": 0, "active": 1, "today": 2, "rest": 3, "idle": 4}
+
+
+def group_projects(rows, titles):
+    """Una fila por PROYECTO: la sesion mas relevante y cuantas sesiones tiene."""
+    groups = {}
+    for row in rows:
+        key = row.get("cwd") or row["project"]
+        title = titles.get(row.get("cwd")) or row["project"]
+        current = groups.get(key)
+        if current is None:
+            groups[key] = {
+                "id": row["id"], "preset": row["preset"], "project": title,
+                "status": row["status"], "age": row["age"], "mtime": row["mtime"],
+                "count": 1, "depth": 0, "orphan": False,
+            }
+            continue
+        current["count"] += 1
+        better = STATUS_RANK[row["status"]] < STATUS_RANK[current["status"]]
+        same_newer = row["status"] == current["status"] and row["mtime"] > current["mtime"]
+        if better or same_newer:
+            current.update({
+                "id": row["id"], "preset": row["preset"], "status": row["status"],
+                "age": row["age"], "mtime": row["mtime"], "project": title,
+            })
+    return sorted(groups.values(), key=lambda g: (STATUS_RANK[g["status"]], -g["mtime"]))
+
+
+def real_mode(row, engine_mode, target_sid="", engine_at_ms=0):
+    """Modo REAL de la sesion: su ultimo `agent-preset/selected` del log.
+    Sin reglas por sessionId ni por motor global: el tool ya registra la seleccion
+    en los dos caminos (memoria y supervisor). El motor del proceso va en la cabecera."""
+    return row.get("preset") or "standard"
+def order_rows(rows):
+    for row in rows:
+        row["status"] = status_of(row["age"])
+    rows.sort(key=lambda r: (STATUS_RANK[r["status"]], -r["mtime"]))
+    return rows
+
+
+def send_switch(mode):
+    payload = {
+        "mode": mode,
+        "reason": "Cambio manual desde dsh-top en vivo (Sosi)",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = REQ_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, REQ_FILE)
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# pintado
+# --------------------------------------------------------------------------
+class View:
+    def __init__(self):
+        self.page = 0
+        self.only_recent = False
+        self.show_subagents = False
+        self.show_orphans = False
+        self.message = ""
+        self.message_until = 0.0
+        self.pending = None
+        self.force_reload = False
+
+    def flash(self, text, seconds=3.0):
+        self.message = text
+        self.message_until = time.time() + seconds
+
+
+def term_size():
+    size = shutil.get_terminal_size(fallback=(120, 32))
+    return max(80, size.columns), max(16, size.lines)
+
+
+def render(view, interactive=True):
+    width, height = term_size()
+    engine = engine_state()
+    rows = order_rows(collect_sessions(force=view.force_reload))
+    view.force_reload = False
+    attached = workspace_sessions()
+    for r in rows:
+        r["orphan"] = bool(attached is not None and r.get("depth", 0) == 0
+                           and r["id"] not in attached)
+
+    total = len(rows)
+    live = sum(1 for r in rows if r["status"] == "live")
+    active = sum(1 for r in rows if r["status"] == "active")
+    today = sum(1 for r in rows if r["status"] == "today")
+    sub_count = sum(1 for r in rows if r.get("depth", 0) > 0)
+    orphan_count = sum(1 for r in rows if r.get("orphan") and r["status"] != "live")
+    project_keys = {(r.get("cwd") or r["project"]) for r in rows
+                    if r.get("depth", 0) == 0 and not r.get("orphan")}
+    conv_count = len(project_keys)
+
+    titles = workspace_titles()
+    subagents = [r for r in rows if r.get("depth", 0) > 0]
+    orphans = [r for r in rows if r.get("orphan") and r["status"] != "live"]
+    base = rows if view.show_subagents else [r for r in rows if r.get("depth", 0) == 0]
+    if not view.show_orphans:
+        base = [r for r in base if not r.get("orphan") or r["status"] == "live"]
+    visible = base
+    if view.only_recent:
+        visible = [r for r in base if r["status"] in ("live", "active", "today")]
+    # una fila por proyecto, no por sesion
+    visible = group_projects(visible, titles)
+
+    chrome = 12  # clear + 2 lineas + titulo + resumen + cabecera + 2 separadores + pie(3) + linea
+    per_page = max(1, height - chrome)
+    pages = max(1, (len(visible) + per_page - 1) // per_page)
+    if view.page >= pages:
+        view.page = pages - 1
+    start = view.page * per_page
+    page_rows = visible[start:start + per_page]
+
+    mode = engine["mode"]
+    mode_txt = "%s %s" % (MODE_ICON.get(mode, "\u2699\ufe0f"), MODE_LABEL.get(mode, mode.upper()))
+    mode_col = MODE_COLOR.get(mode, "\033[1;35m")
+    pid_txt = str(engine["pid"] or "-")
+    if not engine["alive"]:
+        pid_txt += " (\u2717)"
+    clock = time.strftime("%H:%M:%S")
+    stamp = time.strftime("%Y-%m-%d")
+
+    line = "\u2550" * max(40, width - 2)
+    out = []
+    out.append("\033[2J\033[H")
+    out.append(BOLD + "\033[1;36m" + line + RESET)
+    title = "  \U0001f525 DSH FLEET MONITOR  \u2014  %s  \u2022  %s  \u2022  port 3080" % (stamp, clock)
+    out.append(BOLD + "\033[1;37m" + fit(title, width) + RESET)
+    summary = "  Engine: %s%s%s  \u2022  pid %s  \u2022  %d projects + %d subagents + %d orphans  \u2022  %d live, %d active, %d today" % (
+        mode_col, mode_txt, RESET, pid_txt, conv_count, sub_count, orphan_count, live, active, today,
+    )
+    out.append(fit(summary, width))
+    out.append(BOLD + "\033[1;36m" + line + RESET)
+
+    # anchos de columna adaptados al terminal
+    fixed = 9 + 1 + 13 + 1 + 15 + 1 + 9  # id, modo, estado, actividad + separadores
+    project_w = max(18, min(70, width - fixed - 2))
+    header = "%s %s %s %s %s" % (
+        fit("PROJECT", project_w),
+        fit("AGENT/ID", 9),
+        fit("REAL MODE", 13),
+        fit("STATUS", 15),
+        fit("ACTIVITY", 9, "right"),
+    )
+    out.append(BOLD + "\033[1;37m" + header + RESET)
+    out.append("\033[0;36m" + "\u2500" * min(width, 200) + RESET)
+
+    for row in page_rows:
+        preset = real_mode(row, engine["mode"], engine.get("sessionId", ""), engine.get("atMs", 0))
+        mode_cell = "%s %s" % (MODE_ICON.get(preset, "\u2699\ufe0f"), MODE_LABEL.get(preset, preset.upper()))
+        color, status_txt = STATUS_RENDER[row["status"]]
+        status_cell = color + status_txt + RESET
+        project_label = row["project"]
+        if row.get("count", 1) > 1:
+            project_label = "%s (%d)" % (project_label, row["count"])
+        out.append("%s %s %s %s %s" % (
+            fit(project_label, project_w),
+            fit(row["id"][:8], 9),
+            MODE_COLOR.get(preset, "") + fit(mode_cell, 13) + RESET,
+            fit(status_cell, 15),
+            fit(ago_text(row["age"]), 9, "right"),
+        ))
+
+    if not page_rows:
+        out.append(DIM + "  (no sessions match this filter)" + RESET)
+
+    out.append("\033[0;36m" + "\u2500" * min(width, 200) + RESET)
+
+    page_txt = "\u2190 page %d/%d \u2192" % (view.page + 1, pages) if interactive else "all"
+    filter_txt = "recent only (24h)" if view.only_recent else "all"
+    if view.show_subagents:
+        sub_txt = "[a] hide %d subagents" % len(subagents)
+    elif subagents:
+        sub_txt = "%d subagents hidden [a]" % len(subagents)
+    else:
+        sub_txt = "no subagents"
+    if view.show_orphans:
+        orph_txt = "[o] hide %d orphans" % orphan_count
+    elif orphan_count:
+        orph_txt = "%d orphans (deleted project) [o]" % orphan_count
+    else:
+        orph_txt = "no orphans"
+    footer1 = "  %s  \u2022  %d visible  \u2022  filter: %s  \u2022  %s  \u2022  %s" % (
+        page_txt, len(visible), filter_txt, sub_txt, orph_txt)
+    if _stats["empty"]:
+        footer1 += "  \u2022  %d empty hidden" % _stats["empty"]
+    out.append(fit(footer1, width))
+    if view.message and time.time() < view.message_until:
+        out.append(BOLD + "\033[1;33m" + fit("  " + view.message, width) + RESET)
+    else:
+        out.append("")
+    keys = (
+        "[p]PTC [s]Std [t]Team [m]Min [c]Creator \u00b7 "
+        "[y]yes [a]subagents [o]orphans [f]filter \u00b7 [n/b]page [r]reload [q]quit"
+    )
+    out.append(DIM + fit("  " + keys, width) + RESET)
+    out.append(BOLD + "\033[1;36m" + line + RESET)
+
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# loop interactivo
+# --------------------------------------------------------------------------
+MODE_KEYS = {
+    "p": "ptc", "s": "standard", "t": "team",
+    "m": "minimal", "c": "creator",
+}
+
+
+def handle_key(view, ch):
+    if ch in ("q", "Q", "\x03"):
+        return False
+    # Una conmutacion pide confirmacion: escribir en la ventana NO debe cambiar
+    # el motor por accidente (paso de verdad y el modo acababa en creator/team).
+    if view.pending is not None:
+        mode = view.pending
+        view.pending = None
+        if ch in ("y", "Y", "\r", "\n"):
+            ok = send_switch(mode)
+            view.flash(("Switching to %s\u2026" % MODE_LABEL.get(mode, mode.upper())) if ok
+                       else "Could not write the switch request")
+        else:
+            view.flash("Change to %s cancelled" % MODE_LABEL.get(mode, mode.upper()))
+        return True
+    if ch.lower() in MODE_KEYS:
+        view.pending = MODE_KEYS[ch.lower()]
+        view.flash("Switch to %s? press [y] to confirm, any other key cancels"
+                   % MODE_LABEL.get(view.pending, view.pending.upper()), 8)
+    elif ch in ("n", "N", " "):
+        view.page += 1
+    elif ch in ("b", "B"):
+        view.page = max(0, view.page - 1)
+    elif ch in ("o", "O"):
+        view.show_orphans = not view.show_orphans
+        view.page = 0
+    elif ch in ("a", "A"):
+        view.show_subagents = not view.show_subagents
+        view.page = 0
+    elif ch in ("f", "F"):
+        view.only_recent = not view.only_recent
+        view.page = 0
+    elif ch in ("r", "R"):
+        view.force_reload = True
+    return True
+
+
+def read_keys(timeout):
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return []
+    data = os.read(sys.stdin.fileno(), 8)
+    if not data:
+        return [""]
+    keys = []
+    index = 0
+    while index < len(data):
+        byte = data[index:index + 1]
+        if byte == b"\x1b" and data[index:index + 3] in (b"\x1b[C", b"\x1b[D"):
+            keys.append("n" if data[index + 2:index + 3] == b"C" else "b")
+            index += 3
+            continue
+        try:
+            keys.append(byte.decode("utf-8"))
+        except UnicodeDecodeError:
+            keys.append("")
+        index += 1
+    return keys
+
+
+def write_pid():
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def clear_pid():
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as handle:
+            if handle.read().strip() == str(os.getpid()):
+                os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def main():
+    view = View()
+    if not sys.stdin.isatty():
+        render(view, interactive=False)
+        return
+
+    write_pid()
+    old_settings = termios.tcgetattr(sys.stdin)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        sys.stdout.write("\033[?25l")  # oculta cursor
+        while True:
+            render(view)
+            for key in read_keys(REFRESH):
+                if not handle_key(view, key):
+                    return
+    finally:
+        sys.stdout.write("\033[?25h" + RESET)
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        clear_pid()
+        print("\nMonitor stopped.")
+
+
+if __name__ == "__main__":
+    main()

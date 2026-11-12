@@ -1,0 +1,10 @@
+# Motor PTC: apaga el ejecutor nativo y enciende el programático.
+# NOTA: 'ptc-runtime' YA existe en la composición (dump line 315): NO se inserta.
+- id: tool-executor-native
+  disabled: true
+- id: tool-executor-ptc
+  disabled: false
+- id: workflow-ptc
+  disabled: true
+- id: tool-workflow
+  disabled: true

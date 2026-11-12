@@ -1,0 +1,27 @@
+# Dependencias
+node_modules/
+.pnpm-store/
+package-lock.json.bak
+
+# Archivos efímeros de runtime DSH y supervisor
+supervisor.pid
+supervisor.log
+request.json
+state.json
+*.tmp
+*.log
+/tmp/dsh-fleet-monitor.pid
+
+# Python y compilados
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Entorno local y backups
+.DS_Store
+*.swp
+*~
+*.bak
+*.bak.*
+AUDITORIA_*.md
+INFORME_*.md
