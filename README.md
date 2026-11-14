@@ -1,17 +1,21 @@
-# DSH Native Mode Router, Auto-Wakeup & Fleet Monitor
+# DSH Native Mode Router, Per-Session Isolation & Fleet Monitor (v3.0)
 
-Production-grade autonomous engine switching, automatic turn resumption (Auto-Wakeup), and real-time fleet observability for DeepSeek Harness (DSH) on Linux Mint (`127.0.0.1:3080`).
+Production-grade **0 ms per-session in-memory engine switching**, complete **`team` preset isolation**, automatic turn recovery (Auto-Wakeup), and real-time fleet observability for DeepSeek Harness (DSH) on Linux (`127.0.0.1:3080`).
 
 ---
 
-## 1. System Overview & Architecture
+## 1. System Overview & v3.0 Architecture
 
-DeepSeek Harness operates across multiple specialized engines depending on task complexity. Rather than forcing agents to stay in one preset or restarting sessions manually, this project implements an autonomous runtime that:
-1. Allows agents to switch engines dynamically in ~1.2s using `switch_mode`.
-2. Automatically wakes up the calling agent turn upon engine reload via the `POST /__dsh_fleet/wake` webhook.
-3. Protects the runtime with a singleton PID lock (`~/.dsh/mode-router/supervisor.pid`) and runs 24/7 as a systemd user daemon (`dsh-supervisor.service`).
-4. Prevents duplicate browser tabs by enforcing `--no-open` on all server reboots.
-5. Provides both human and AI fleet visibility across 30+ workspaces and 70+ agents via `dsh-top` and `dsh-plugin-fleet-monitor`.
+DeepSeek Harness operates across 5 specialized presets depending on task complexity. Instead of restarting the entire server on every mode change or letting one project's mode leak into another, v3.0 delivers **100% per-session isolation**:
+
+1. **0 ms In-Memory Switching for All 5 Modes (`standard`, `ptc`, `team`, `minimal`, `creator`)**: Calling `switch_mode({ mode, reason })` invokes `presets.recompose(agentCtx, targetPreset)` and appends `agent-preset/selected` solely for the calling session (`[MODO AISLADO]`).
+2. **Zero Server Restarts & Zero Cross-Session Interference**: `dsh web` remains running smoothly on `--patch ~/.dsh/modes/standard.yml --no-open` (`state.json` stays `"standard"`). Other projects and tabs never change mode or lose running prompts.
+3. **True `team` Preset Isolation + Clean Teardown**:
+   - `preset-team` (`Modo Team`) is registered directly in `~/.dsh/profiles/web/cordis.patch.yml`.
+   - `@deepseek-ai/dsh-experimental-tool-agent-team` dynamically mounts the 9 Team tools + `team:policy` + `team:identity` ONLY when `composedPreset === "team"` (or on teammates), and unmounts them immediately upon switching to `ptc`, `standard`, `minimal`, or `creator` (preventing leaks even inside `ptc`'s `run_code`).
+   - `@deepseek-ai/dsh-experimental-client-ui-agent-team` renders the **`👥 Equipo de agentes`** button only when `leadPreset === "team"`.
+4. **High-Availability Supervisor & Auto-Wakeup**: `dsh-supervisor.service` monitors port `3080` 24/7 with singleton PID lock (`~/.dsh/mode-router/supervisor.pid`), `--no-open` duplicate-tab protection, and `POST /__dsh_fleet/wake` recovery fallback.
+5. **Full Session-Accurate Telemetry**: `dsh-top` scans complete `.zstd` logs (`agent-preset/selected`) + `session_projcache` to show each session's exact isolated `REAL MODE`.
 
 ```
                   ┌──────────────────────────────────────────────┐
@@ -22,29 +26,18 @@ DeepSeek Harness operates across multiple specialized engines depending on task 
                                          │
                                          ▼
                  ┌────────────────────────────────────────────────┐
-                 │ Writes ~/.dsh/mode-router/request.json        │
-                 └───────────────────────┬────────────────────────┘
-                                         │  (Hot-switch in ~1.2s)
-                                         ▼
-                 ┌────────────────────────────────────────────────┐
-                 │       dsh-supervisor (PID singleton lock)      │
-                 │   - Graceful SIGTERM of current DSH engine     │
-                 │   - Spawns: dsh web --patch <mode>.yml --no-open│
-                 │   - Waits for 127.0.0.1:3080 to respond       │
-                 └───────────────────────┬────────────────────────┘
-                                         │
-                                         ▼
-                 ┌────────────────────────────────────────────────┐
-                 │    POST /__dsh_fleet/wake (Auto-Wakeup)       │
-                 │   - Dispatched by supervisor to DSH host       │
-                 │   - Calls sessionController.commands.prompt()  │
-                 │   - Injects resumption prompt with wakeup: true│
+                 │  dsh-plugin-switch-mode (Per-Session, 0 ms)    │
+                 │  - Validates preset: standard|ptc|team|minimal │
+                 │    |creator (-> cordis)                        │
+                 │  - presets.recompose(agentCtx, targetPreset)   │
+                 │  - session.append('agent-preset/selected')     │
+                 │  - tool-agent-team & ui-agent-team auto-sync   │
                  └───────────────────────┬────────────────────────┘
                                          │
                                          ▼
                   ┌──────────────────────────────────────────────┐
-                  │    Agent Turn Automatically Resumes          │
-                  │    Continues task in new engine seamlessly!   │
+                  │  Isolated Session Resumes Immediately (0 ms) │
+                  │  Other workspaces & host daemon untouched!   │
                   └──────────────────────────────────────────────┘
 ```
 
@@ -54,51 +47,56 @@ DeepSeek Harness operates across multiple specialized engines depending on task 
 
 ```
 dsh-native-mode-router/
-├── README.md                      # This master reference document
-├── AGENTS.md                      # Global autonomous directives (symlinked to ~/.dsh/AGENTS.md)
-├── SKILL.md                       # Canonical skill reference (symlinked to ~/.dsh/skills/dsh-native-modes/SKILL.md)
+├── README.md                              # This master reference document
+├── AGENTS.md                              # Global autonomous directives (symlinked to ~/.dsh/AGENTS.md)
+├── SKILL.md                               # Canonical skill reference (symlinked to ~/.dsh/skills/dsh-native-modes/SKILL.md)
 ├── mode-router-real/
-│   ├── supervisor.mjs             # Singleton supervisor managing DSH engine lifecycle & auto-wake
-│   ├── modes/                     # Official Cordis YAML mode patch overlays
-│   │   ├── standard.yml           # Base default engine (surgical file editing, standard JSON-RPC)
-│   │   ├── ptc.yml                # Programmatic Tool Calling (TypeScript VM run_code execution)
-│   │   ├── team.yml               # Native Agent Teams (@deepseek-ai/dsh-experimental-agent-team: Lead + 8 teammates, CAS task board, ui-agent-team)
-│   │   ├── minimal.yml            # Interactive persistent PTY bash shell (minimal TTFT <0.5s)
-│   │   └── creator.yml            # Cordis plugin development & introspection runtime
-│   └── plugin/                    # dsh-plugin-switch-mode Cordis tool plugin
-│       ├── index.js               # Registers switch_mode tool, dual-path switching & session event logging
+│   ├── README.md                          # Runtime, supervisor & patch script reference
+│   ├── supervisor.mjs                     # Singleton supervisor (24/7 host watchdog & Auto-Wakeup fallback)
+│   ├── apply-team-isolation-patches.sh    # Idempotent patcher/checker (--check) for @deepseek-ai/dsh updates
+│   ├── modes/                             # Cordis YAML overlays (modes/team.yml = [] to avoid global leaks)
+│   │   ├── standard.yml
+│   │   ├── ptc.yml
+│   │   ├── team.yml
+│   │   ├── minimal.yml
+│   │   └── creator.yml
+│   └── plugin/                            # dsh-plugin-switch-mode Cordis tool plugin
+│       ├── index.js                       # Registers switch_mode tool & in-memory preset switching
 │       └── package.json
-└── dsh-plugin-fleet-monitor/      # Web UI plugin & fleet management
+└── dsh-plugin-fleet-monitor/              # Web UI plugin & fleet management
+    ├── install.sh                         # Installs plugins, dsh-top, dsh-open, optional .desktop entry
+    ├── restart.sh                         # Clean service restart helper
     ├── lib/
-    │   ├── index.js               # Host endpoints: /__dsh_fleet/status, /wake, /launch-terminal
-    │   └── client.js              # Web frontend tab: Settings > Plugins > DSH Fleet Monitor
+    │   ├── index.js                       # Host endpoints: /__dsh_fleet/status, /wake, /launch-terminal
+    │   └── client.js                      # Web frontend tab: Settings > Plugins > DSH Fleet Monitor
     ├── bin/
-    │   ├── dsh-top                # Standalone curses-like real-time fleet monitor CLI (with real_mode resolution)
-    │   └── dsh-open               # User launcher: opens active DSH Web URL with token in browser (avoids EADDRINUSE)
+    │   ├── dsh-top                        # Real-time fleet monitor CLI (per-session real_mode resolution)
+    │   ├── dsh-open                       # User launcher: opens active DSH Web URL in browser (avoids EADDRINUSE)
+    │   └── dsh-empty                      # Helper CLI for cleaning empty archived/stale sessions
     ├── share/
-    │   └── dsh-web.desktop        # Optional desktop/menu entry calling dsh-open
+    │   └── dsh-web.desktop                # Optional desktop/menu entry calling dsh-open
     └── package.json
 ```
 
 ---
 
-## 3. The 5 Native Engines: Decision Matrix
+## 3. The 5 Native Presets: Decision Matrix
 
-Agents have full autonomous authority to switch engines to match task requirements without asking unnecessary user permission:
+Agents have full autonomous authority to chain engines across sub-phases at **0 ms cost** without asking permission:
 
-| Engine | Cordis Patch | Primary Purpose | When An Agent Must Autonomously Switch |
+| Engine | Native Preset | Primary Purpose | When An Agent Must Autonomously Switch |
 |---|---|---|---|
-| **`standard`** | `~/.dsh/modes/standard.yml` | General software engineering, surgical file editing, and Git workflows. | **Universal Default Engine**. Use for reading/writing code, bug fixing, single-file edits, and standard shell tasks. |
-| **`ptc`** | `~/.dsh/modes/ptc.yml` | Programmatic Tool Calling via `run_code` in Node.js VM. | **Mandatory for mass loops and data calculation**: processing arrays >10 items, batch transforming files, mass regex, or chaining 20 operations in a single turn without token blowout. |
-| **`team`** | `~/.dsh/modes/team.yml` | Native Experimental Agent Teams (`agent-team`). | **Mandatory for modular multi-agent tasks**: large objectives requiring parallel specialization (Explorer, Implementer, Auditor), shared CAS task board, and typed mailboxes. |
-| **`minimal`** | `~/.dsh/modes/minimal.yml` | Interactive persistent PTY bash shell (`@deepseek-ai/dsh-tool-bash-persistent`). | **Mandatory for fast interactive shell diagnostics**: network tests, long-running terminal programs, or immediate TTFT <0.5s CLI interaction. |
-| **`creator`** | `~/.dsh/modes/creator.yml` | Cordis plugin development & host introspection. | **Strictly for live Cordis container debugging**. NEVER switch to creator just to edit plugin source files (use `standard`). |
+| **`standard`** | `preset-standard` | `read`/`edit`/`write`, `bash`, `workflow`, `subagent`, `subagent_fork`, `tool-web`. | **Universal Default Mode**. Surgical code edits, git workflows, reading, unit tests, and final delivery. Return here when done in `ptc`/`team`/`minimal`. |
+| **`ptc`** | `preset-ptc` | **`run_code`** in Node.js VM (wrapping tools programmatically + `subagent`). | **Mass loops & context savings**: inspecting/transforming >5-10 files, cross-referencing JSONs/logs, bulk regex, or chaining 10-20 tool calls in 1 turn. |
+| **`team`** | `preset-team` (`Modo Team`) | **9 `agent-team` tools** + `team:policy` + `workflow` + Web UI panel. | **Modular parallel work**: Lead + up to 7 named durable teammates (`explorer`, `implementer`, `qa-auditor`), shared CAS task board, typed mailboxes. |
+| **`minimal`** | `preset-minimal` | Persistent PTY bash shell (`bash-persistent`), minimal footprint. | **Interactive shell diagnostics**: sustained PTY troubleshooting or network/service debugging. |
+| **`creator`** | `preset-cordis` | Standard toolset + `@deepseek-ai/dsh-tool-cordis`. | **Strictly for live Cordis container introspection**. NEVER switch to creator just to edit plugin source files (use `standard`). |
 
 ---
 
-## 4. Autonomous Tool: `switch_mode` & Dual-Path Architecture
+## 4. Autonomous Tool: `switch_mode` & Strategic Multi-Engine Chaining
 
-The tool is exported by `dsh-plugin-switch-mode` and available to all agents across all sessions:
+Exported by `dsh-plugin-switch-mode` (`~/.dsh/profiles/web/node_modules/dsh-plugin-switch-mode`):
 
 ```json
 switch_mode({
@@ -107,89 +105,60 @@ switch_mode({
 })
 ```
 
-### Dual-Path Switching Architecture:
-1. **In-Memory Recompose (Fast Path)**: If the target mode can be satisfied within the active agent preset registry (`ctx.agentPresets.recompose`), the runtime recompiles the container instantly without restarting DSH or disturbing other workspaces.
-2. **Supervisor Daemon Reload (Engine Overlay Path)**: For overlays like `team.yml` or `ptc.yml` that add or replace native Cordis services, the tool writes `{ mode, reason, sessionId, at, pid }` to `~/.dsh/mode-router/request.json`.
-   - The systemd supervisor daemon (`dsh-supervisor.service`) intercepts the request in <500ms.
-   - Gracefully stops the current DSH instance and restarts DSH with `--patch ~/.dsh/modes/<mode>.yml --no-open` (~1.2s reboot time).
-   - Once port `3080` answers, the supervisor issues `POST /__dsh_fleet/wake`.
-   - The fleet host plugin delivers the continuation prompt (`wakeup: true`) directly into the agent's turn.
-3. **Session Log Synchronization**: Both switching paths append an `agent-preset/selected` event to the session storage. This guarantees that `dsh-top` and the Web UI immediately reflect the new active engine in the `REAL MODE` telemetry column.
+### Strategic Advantage Patterns (0 ms Chaining)
+- **`standard -> ptc -> standard`**: Hop into `ptc` for batch computation/filtering over dozens of files via `run_code` in a single turn, then hop right back to `standard` for surgical edits.
+- **`standard -> team -> standard`**: Hop into `team` for parallel implementation/review with disjoint `write_scopes`, then hop back to `standard` (unmounting all 9 team tools and the UI button cleanly).
+- **`workflow` vs `team` vs `subagent`**:
+  - Use **`team`** (`switch_mode({ mode: "team" })`) for durable interactive teammates + shared CAS board.
+  - Use **`workflow`** (`tools.workflow`, available in `standard` AND `team`) whenever you need a **specific model per child** (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-vision-exp` for images) or deterministic JS `parallel`/`pipeline`.
+  - Use **`subagent` / `subagent_fork`** (in `standard` or `ptc`) for quick single subtasks using the default model.
 
 ---
 
 ### 4.1 Native Agent Teams (`team` Mode) Architecture & The 9 Tools
 
-When switched to `team` mode, legacy subagent tools (`tool-subagent`, `tool-subagent-fork`, `tool-subagent-control`) are disabled. DSH mounts the official `@deepseek-ai/dsh-experimental-agent-team` stack (configured with `maxMembers: 8`, `maxTasks: 256`, `freshProvider: spawn`, `forkProvider: fork`, and `ui-agent-team`).
+Registered in `~/.dsh/profiles/web/cordis.patch.yml` as `preset-team` alongside `@deepseek-ai/dsh-experimental-agent-team` (`maxMembers: 8`, `maxTasks: 256`, `maxMessageBytes: 65536`, `disposalTimeoutMs: 5000`), `@deepseek-ai/dsh-experimental-tool-agent-team` (`freshProvider: spawn`, `forkProvider: fork`), and `@deepseek-ai/dsh-experimental-client-ui-agent-team`.
 
-The session functions as the **Team Lead** (`lead`) with access to 9 native coordination tools:
+The session acts as **Team Lead** (`lead`) with 9 coordination tools:
 
 #### 1. Teammate Lifecycle Management
-- **`spawn_teammate({ name, description, prompt, context })`** *(Lead only)*:
-  - Spawns a durable named teammate agent.
-  - `name`: Unique lower-kebab-case identifier (e.g. `explorer`, `implementer`, `qa-auditor`).
-  - `description`: Short functional responsibility.
-  - `prompt`: Self-contained mission brief with explicit objectives.
-  - `context`: `"fresh"` (clean context window, default) or `"fork"` (inherits parent conversation history).
-- **`list_agents({})`** *(Any member)*:
-  - Returns the roster of all team members with their roles and availability status (`running`, `inactive`, `provisioning`, `failed`).
-  - *Note*: `inactive` indicates the agent's turn concluded and it is awaiting its next message or task; it does NOT mean it was terminated.
-- **`wait_agent({ timeout_ms })`** *(Any member)*:
-  - Non-blocking synchronization waiting for teammate activity or task state transitions (timeout 10,000ms to 3,600,000ms, default 30,000ms).
-  - Immediately returns `noProgress` if no peer is active, preventing busy polling loops.
-- **`interrupt_agent({ target })`** *(Lead only)*:
-  - Gracefully aborts a teammate's active turn while preserving its message queue and state.
+- **`spawn_teammate({ name, description, prompt, context })`** *(Lead only)*: Spawns durable named teammate (`fresh` or `fork`).
+- **`list_agents({})`** *(Any member)*: Lists roster with roles and status (`running`, `inactive`, `provisioning`, `failed`).
+- **`wait_agent({ timeout_ms })`** *(Any member)*: Waits for teammate/task activity (`10000`–`3600000` ms, default `30000`); returns `noProgress` immediately if no peer is active.
+- **`interrupt_agent({ target })`** *(Lead only)*: Gracefully aborts a teammate's active turn while preserving its inbox.
 
 #### 2. Inter-Agent Communication
-- **`send_message({ target, message })`** *(Any member)*:
-  - Delivers a typed message to `target` (`"lead"` or teammate name).
-  - Wakes up an `inactive` member immediately or queues for the next step boundary if currently executing. Returns `{ "sent": true }`.
+- **`send_message({ target, message })`** *(Any member)*: Steers a `running` target at the nearest step boundary or wakes an `inactive` target. Returns `{ "sent": true }`.
 
 #### 3. Shared CAS Task Board
-- **`team_task_create({ subject, description, blocked_by, write_scopes })`** *(Any member)*:
-  - Adds a new task to the team board.
-  - `blocked_by`: Array of prerequisite task IDs establishing DAG dependency order.
-  - `write_scopes`: Advisory workspace subpaths to prevent concurrent edits (e.g. `["src/backend/"]`).
-- **`team_task_list({ status, owner, ready, cursor, limit })`** *(Any member)*:
-  - Queries the board with status filters (`pending`, `in_progress`, `completed`). Returns task IDs, current owners, and current `revision`.
-- **`team_task_get({ task_id })`** *(Any member)*:
-  - Retrieves full task specification and latest `revision` before initiating modifications.
-- **`team_task_update({ task_id, expected_revision, action, ... })`** *(Any member)*:
-  - **Atomic Compare-And-Set (CAS)**: `expected_revision` MUST match the board's current revision number, preventing race conditions among concurrent teammates.
-  - `action`: `"claim"`, `"release"`, `"edit"`, `"set_dependencies"`, `"complete"`, `"reopen"`, `"reassign"`, `"delete"`.
+- **`team_task_create({ subject, description, blocked_by, write_scopes })`** *(Any member)*: Creates a task with optional DAG blockers and advisory `write_scopes`.
+- **`team_task_list({ status, owner, ready, cursor, limit })`** *(Any member)*: Lists tasks, `ownerName`, and `revision`.
+- **`team_task_get({ task_id })`** *(Any member)*: Retrieves full task details and latest `revision`.
+- **`team_task_update({ task_id, expected_revision, action, ... })`** *(Any member)*: Atomic Compare-And-Set (`claim`, `release`, `edit`, `set_dependencies`, `complete`, `reopen`, `reassign`, `delete`).
 
 ---
 
-## 5. Systemd Daemon & Singleton Lock
+## 5. Systemd Daemon, Singleton Lock & Patch Maintenance
 
-The supervisor runs 24/7 as a managed systemd user service with Linux user lingering enabled:
+The supervisor runs 24/7 as a managed systemd user service with `--patch ~/.dsh/modes/standard.yml --no-open`:
 
 ```bash
-# Service status
 systemctl --user status dsh-supervisor.service
-
-# Restart supervisor
 systemctl --user restart dsh-supervisor.service
 ```
 
-### Singleton Lock (`~/.dsh/mode-router/supervisor.pid`):
-- Any attempt to run a secondary supervisor (e.g. `node supervisor.mjs`) checks the PID inside `supervisor.pid`.
-- If the PID is active, the second instance aborts immediately with exit code 1:
-  `ABORTADO: ya hay un supervisor vivo (pid <PID>), no arranco otro`.
-- Prevents split-brain races, corrupted `request.json` polling, and port 3080 conflicts.
+- **Singleton Lock (`~/.dsh/mode-router/supervisor.pid`)**: Prevents duplicate supervisors or port `3080` conflicts.
+- **Post-Upgrade Patch Script (`mode-router-real/apply-team-isolation-patches.sh`)**:
+  Re-applies the 3 global package patches (`dsh-experimental-tool-agent-team`, `dsh-experimental-client-ui-agent-team`, `dsh-llm-deepseek` `allDeferred`) after upgrading `@deepseek-ai/dsh`:
+  ```bash
+  bash mode-router-real/apply-team-isolation-patches.sh --check
+  ```
 
 ---
 
 ## 6. Opening the Web UI (`dsh-open`) & Duplicate Tab Protection (`--no-open`)
 
-When `dsh web` boots without `--no-open`, it calls the OS default browser launcher on every boot. Because mode switches reload DSH, this previously opened a new tab on every switch.
-
-Enforcing `['web', '--patch', patch, '--no-open']` in `supervisor.mjs` ensures:
-- DSH Web starts silently on `http://127.0.0.1:3080`.
-- Existing open browser tabs automatically reconnect their WebSocket.
-- Exactly zero unwanted tabs are spawned.
-
-Because `dsh-supervisor.service` already owns port `3080` in the background, running `dsh web` manually fails with `listen EADDRINUSE: address already in use 127.0.0.1:3080`. Instead, use the companion launcher **`dsh-open`** (installed to `/usr/local/bin/dsh-open` by `dsh-plugin-fleet-monitor/install.sh`):
+Because `dsh-supervisor.service` owns port `3080` continuously, running `dsh web` manually fails with `listen EADDRINUSE`. Instead, use **`dsh-open`** (installed to `/usr/local/bin/dsh-open` by `dsh-plugin-fleet-monitor/install.sh`):
 
 ```bash
 dsh-open              # Ensure supervisor is running and open the active token URL in your browser
@@ -199,32 +168,18 @@ dsh-open --restart    # Restart dsh-supervisor.service and open the fresh URL
 ```
 
 > [!TIP]
-> Once opened once with `?token=...`, DSH issues a persistent signed `HttpOnly` cookie valid for 30 days (`cookieMaxAgeDays: 30`), allowing `http://127.0.0.1:3080/` to work across reboots and mode switches in that browser. Pass `--desktop` to `dsh-plugin-fleet-monitor/install.sh` to install the application menu shortcut (`dsh-web.desktop`).
+> Once opened once with `?token=...`, DSH issues a persistent signed `HttpOnly` cookie valid for 30 days (`cookieMaxAgeDays: 30`), allowing `http://127.0.0.1:3080/` to work across reboots in that browser. Pass `--desktop` to `dsh-plugin-fleet-monitor/install.sh` to install the application menu shortcut (`dsh-web.desktop`).
 
 ---
 
 ## 7. DeepSeek Messages API Patch (`defer_loading`)
 
-**Root cause:** When DSH resumed sessions across mode changes, all newly exposed tools were initialized with `deferLoading: true`. The DeepSeek API rejected the request with `tools: at least one tool must have defer_loading=false. All tools cannot be deferred.`.
-
-**Upstream fix in `@deepseek-ai/dsh-llm-deepseek` (or `packages/llm/llm-deepseek/src/serialize.ts`):**
-If all tools are marked with `deferLoading === true`, the `defer_loading` flag is omitted, making all tools immediately admitted by the API without errors.
+When sessions dynamically toggle tools across presets, `tools` could all arrive with `deferLoading: true`, causing DeepSeek API to reject with `tools: at least one tool must have defer_loading=false`. The `allDeferred` guard in `@deepseek-ai/dsh-llm-deepseek` omits `defer_loading` in that edge case (checked and restored by `mode-router-real/apply-team-isolation-patches.sh`).
 
 ---
 
 ## 8. Fleet Observability: `dsh-top` CLI & Web Tab
 
-Humans and agents can monitor all 30+ workspaces and 70+ fleet sessions in real time:
-
-- **Interactive CLI:** Run `/usr/local/bin/dsh-top` (or `dsh-mode --live`).
-  - Auto-refreshes every 1.5s.
-  - **Accurate Real Mode Telemetry:** `real_mode` resolves the effective engine directly from the session's recorded preset log (`agent-preset/selected`), displaying `\033[1;34m👥 TEAM\033[0m`, `⚡ STANDARD`, `⚙️ PTC`, `📟 MINIMAL`, or `🛠️ CREATOR`.
-  - **Hotkeys:**
-    - `p` / `s` / `t` / `m` / `c`: Request global engine switch (`t` switches to `team` mode) and confirm with `y`.
-    - `a`: Toggle visibility of subagents / teammates (`delegationDepth > 0`).
-    - `o`: Toggle visibility of orphaned sessions from deleted workspaces.
-    - `f`: Filter sessions (all sessions vs active in last 24h).
-    - `q`: Quit monitor.
-- **Web UI Integration:** Go to *Settings > Plugins > DSH Fleet Monitor* in the DSH web interface.
-  - Displays live engine status, uptime, and active session count.
-  - Includes button: **"🚀 Abrir Terminal en Vivo"** which launches `gnome-terminal` on `DISPLAY=:0` running `dsh-top`.
+- **Interactive CLI / Snapshot:** `/usr/local/bin/dsh-top` (or `/usr/local/bin/dsh-top --once`).
+  - Reads full `.zstd` logs (`agent-preset/selected`) + `session_projcache` to show per-session `REAL MODE` (`👥 TEAM`, `⚡ STANDARD`, `⚙️ PTC`, `📟 MINIMAL`, `🛠️ CREATOR`).
+- **Web UI Integration:** *Settings > Plugins > DSH Fleet Monitor* (live status + **"🚀 Abrir Terminal en Vivo"** button launching `dsh-top` on `DISPLAY=:0`).

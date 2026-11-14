@@ -1,40 +1,36 @@
-# mode-router-real — Runtime Architecture & Supervisor Reference
+# mode-router-real — Runtime Architecture, Supervisor & Patch Reference (v3.0)
 
-Production hot-switching engine and Auto-Wakeup daemon for DeepSeek Harness (DSH Web) on Linux Mint (`127.0.0.1:3080`).
+Per-session 0 ms in-memory engine router, high-availability supervisor watchdog, and idempotent isolation patcher for DeepSeek Harness (`127.0.0.1:3080`).
 
 ## Subsystems
 
-| Component | Path | Function | Production Status |
+| Component | Path | Function | Status |
 |---|---|---|---|
-| **Switch Mode Plugin** | `plugin/index.js` | Cordis host tool `switch_mode(mode, reason)`. Dual-path: in-memory recompose + supervisor request file. | Active (`~/.dsh/profiles/web/node_modules/dsh-plugin-switch-mode`) |
-| **Supervisor Daemon** | `supervisor.mjs` | Singleton daemon managing `--patch` lifecycle, Auto-Wakeup, and `--no-open` tab protection. | Managed by `dsh-supervisor.service` (systemd user unit) |
-| **Engine Overlays** | `modes/*.yml` | Cordis YAML overlays: `standard.yml`, `ptc.yml`, `team.yml`, `minimal.yml`, `creator.yml`. | Active in `~/.dsh/modes/` and tracked in repo `modes/` |
+| **Switch Mode Plugin** | `plugin/index.js` | Cordis host tool `switch_mode(mode, reason)`. Recomposes active session preset (`standard`, `ptc`, `team`, `minimal`, `cordis`) in 0 ms in memory (`[MODO AISLADO]`). | Active (`~/.dsh/profiles/web/node_modules/dsh-plugin-switch-mode`) |
+| **Supervisor Daemon** | `supervisor.mjs` | Singleton daemon keeping `dsh web` running 24/7 with `--patch ~/.dsh/modes/standard.yml --no-open` and `POST /__dsh_fleet/wake` recovery fallback. | Managed by `dsh-supervisor.service` |
+| **Isolation Patcher** | `apply-team-isolation-patches.sh` | Verifies (`--check`) and re-applies the 3 global `@deepseek-ai/dsh` patches (`tool-agent-team`, `client-ui-agent-team`, `dsh-llm-deepseek` `allDeferred`). | Idempotent maintenance script |
+| **Engine Overlays** | `modes/*.yml` | Legacy/base YAML overlays (`standard.yml` and `team.yml` are `[]` so per-session preset isolation governs `team` without disabling subagents globally). | Synced with `~/.dsh/modes/` |
 
-## Operational Architecture & Production Verification
+## Architecture v3.0: How Isolation Works
 
-- **Production Service**: The supervisor runs 24/7 as a managed systemd user service (`systemctl --user status dsh-supervisor.service`) with Linux lingering enabled.
-- **Dual-Path Switching**: Mode switching combines in-memory preset switching with supervisor `--patch` overlays. Deep overlays (`team`, `ptc`) use supervisor restart to cleanly mount native Cordis plugins and tools in ~1.2s.
-- **Auto-Wakeup**: When DSH reboots, `supervisor.mjs` issues `POST /__dsh_fleet/wake` with `{ sessionId, mode, reason }`. The plugin injects the prompt so the agent resumes inference automatically without human intervention.
-- **Duplicate Tab Protection**: DSH is invoked with `['web', '--patch', patch, '--no-open']`, completely preventing browser tab clutter.
-- **Singleton PID Guard**: `~/.dsh/mode-router/supervisor.pid` enforces exactly one running supervisor instance, eliminating split-brain races and port 3080 conflicts.
+1. **All 5 Modes Are Native Presets**: `preset-standard`, `preset-ptc`, `preset-minimal`, `preset-cordis` (alias `creator`), and `preset-team` (`Modo Team`, registered in `~/.dsh/profiles/web/cordis.patch.yml`).
+2. **In-Memory Switching (`0 ms`, zero restarts)**: `switch_mode({ mode, reason })` calls `await presets.recompose(agentCtx, targetPreset)` and appends `agent-preset/selected` ONLY to the calling session. Neither `dsh web` nor other open workspaces restart or change mode; `~/.dsh/mode-router/state.json` stays `"standard"`.
+3. **Clean `team` Teardown**:
+   - `dsh-experimental-tool-agent-team/lib/index.js` listens to `agent/created`, `agent-preset/selected`, and `tools/change`, mounting the 9 team tools + `team:policy` + `team:identity` ONLY when `composedPreset(agent.ctx) === "team"` (or on teammates), and disposing them immediately when switching to `ptc`, `standard`, `minimal`, or `creator`.
+   - `dsh-experimental-client-ui-agent-team/lib/client.js` renders the `👥 Equipo de agentes` header button only when `leadPreset === "team"`.
 
-## Team Mode Configuration (`modes/team.yml`)
-
-`team.yml` replaces legacy single-threaded subagents with DeepSeek's experimental agent-team stack:
-- Disables: `tool-subagent-control`, `tool-subagent`, `tool-subagent-fork`.
-- Enables: `@deepseek-ai/dsh-experimental-agent-team` (configured with `maxMembers: 8`, `maxTasks: 256`, `maxMessageBytes: 65536`, `disposalTimeoutMs: 5000`).
-- Enables: `@deepseek-ai/dsh-experimental-tool-agent-team` (configured with `freshProvider: spawn`, `forkProvider: fork`).
-- Enables: `@deepseek-ai/dsh-experimental-client-ui-agent-team` (Web UI team monitor).
-
-## Management Commands
+## Management & Verification Commands
 
 ```bash
-# Check service status
+# Check supervisor service status
 systemctl --user status dsh-supervisor.service
 
-# View live supervisor logs
-journalctl --user -u dsh-supervisor.service -f
+# Audit global package patches + cordis.patch.yml preset-team
+bash mode-router-real/apply-team-isolation-patches.sh --check
 
-# Safe restart
-systemctl --user restart dsh-supervisor.service
+# Re-apply patches after upgrading @deepseek-ai/dsh
+bash mode-router-real/apply-team-isolation-patches.sh
+
+# Inspect per-session real modes without touching state.json
+dsh-top --once
 ```
