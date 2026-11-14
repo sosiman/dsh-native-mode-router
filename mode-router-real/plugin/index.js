@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, renameSync, readdirSync, statSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, renameSync, readdirSync, statSync, existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -6,9 +6,20 @@ export const name = 'switch-mode-tool'
 export const inject = ['tools', 'agentPresets', 'agents']
 
 const MODES = ['minimal', 'standard', 'ptc', 'team', 'creator']
+const VALID_AGENT_PRESETS = ['standard', 'ptc', 'minimal', 'cordis']
 const REQUEST_DIR = join(homedir(), '.dsh', 'mode-router')
 const REQUEST_FILE = join(REQUEST_DIR, 'request.json')
+const STATE_FILE = join(REQUEST_DIR, 'state.json')
 const SESSIONS_DIR = join(homedir(), '.dsh', 'sessions')
+
+function readCurrentState() {
+  try {
+    if (!existsSync(STATE_FILE)) return null
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+  } catch {
+    return null
+  }
+}
 
 function resolveActiveSessionId(rawAgentId) {
   if (rawAgentId) {
@@ -98,40 +109,66 @@ export function apply(ctx) {
       const rawAgentId = initiator?.id || exec?.agent?.id || exec?.agent?.session?.id || null
       const sessionId = resolveActiveSessionId(rawAgentId)
       const targetPreset = mode === 'creator' ? 'cordis' : mode
+      const safeAgentPreset = VALID_AGENT_PRESETS.includes(targetPreset) ? targetPreset : 'standard'
+      const currentState = readCurrentState()
+      const session = initiator?.session || exec?.agent?.session
 
-      // 1. Intento de conmutación en memoria si el agente y el preset lo permiten
       const presets = ctx.agentPresets || (ctx.get ? ctx.get('agentPresets') : null)
       const agentCtx = initiator?.ctx || exec?.agent?.ctx
-      if (presets && agentCtx && ['standard', 'ptc', 'minimal', 'cordis', 'team'].includes(targetPreset)) {
+      let presetRecorded = false
+      const recordSafePreset = () => {
+        if (presetRecorded || !session?.append) return
         try {
-          await presets.recompose(agentCtx, targetPreset)
-          const session = initiator?.session || exec?.agent?.session
-          if (session?.append) {
-            session.append('agent-preset/selected', { agentPreset: targetPreset })
+          session.append('agent-preset/selected', { agentPreset: safeAgentPreset })
+          presetRecorded = true
+        } catch { /* el registro es best-effort */ }
+      }
+
+      // 1. Modos con preset nativo DSH (standard, ptc, minimal, cordis)
+      if (VALID_AGENT_PRESETS.includes(targetPreset)) {
+        const needsSupervisorResetFromTeam = mode === 'standard' && currentState?.mode === 'team'
+        if (presets && agentCtx) {
+          try {
+            await presets.recompose(agentCtx, safeAgentPreset)
+            recordSafePreset()
+            if (!needsSupervisorResetFromTeam) {
+              return {
+                status: 'accepted',
+                mode,
+                message:
+                  `[MODO AISLADO]: Esta sesión ha cambiado a '${mode}' en memoria de forma instantánea. ` +
+                  `El servidor dsh web NO se ha reiniciado y todos tus demás proyectos permanecen 100% intactos en sus propios motores. ` +
+                  `Motivo: ${reason.trim()}`
+              }
+            }
+          } catch {
+            // Si recompose falla, continúa al supervisor sin bloquear
           }
+        }
+      } else if (mode === 'team') {
+        // `team` es un overlay de supervisor, NUNCA un agentPreset de DSH.
+        // Recompone/registra la sesión en 'standard' para que reanude siempre sin errores.
+        if (presets && agentCtx) {
+          try {
+            await presets.recompose(agentCtx, 'standard')
+          } catch { /* best-effort antes del overlay o reutilización */ }
+        }
+        recordSafePreset()
+        if (currentState?.mode === 'team' && currentState?.pid === process.pid) {
           return {
             status: 'accepted',
-            mode,
+            mode: 'team',
             message:
-              `[MODO AISLADO]: Esta sesión ha cambiado a '${mode}' en memoria de forma instantánea. ` +
-              `El servidor dsh web NO se ha reiniciado y todos tus demás proyectos permanecen 100% intactos en sus propios motores. ` +
+              `[MODO TEAM ACTIVO]: El motor 'team' ya está cargado en este proceso y esta sesión ` +
+              `ha quedado lista con sus herramientas base estándar y agent-team sin reiniciar el servidor. ` +
               `Motivo: ${reason.trim()}`
           }
-        } catch {
-          // Si recompose falla, continúa al supervisor sin bloquear
         }
       }
 
-      // 2. Conmutación vía supervisor (para team y modos con reinicio)
-      // Sin bloqueo restrictivo: escribe la petición y el supervisor reinicia + Auto-Wakeup
-      // Se registra la selección TAMBIÉN aquí: si no, el monitor (que lee el log de la
-      // sesión) seguiría mostrando el preset anterior tras un cambio global.
-      const switchSession = initiator?.session || exec?.agent?.session
-      if (switchSession?.append) {
-        try {
-          switchSession.append('agent-preset/selected', { agentPreset: targetPreset })
-        } catch { /* el registro es best-effort */ }
-      }
+      // 2. Conmutación vía supervisor (para team y restauración a standard desde team, o fallback)
+      // Registra SIEMPRE safeAgentPreset (nunca 'team') para proteger la reanudación en frío.
+      recordSafePreset()
       mkdirSync(REQUEST_DIR, { recursive: true })
       const request = {
         mode,
