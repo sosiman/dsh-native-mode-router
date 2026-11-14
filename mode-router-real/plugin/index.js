@@ -6,7 +6,7 @@ export const name = 'switch-mode-tool'
 export const inject = ['tools', 'agentPresets', 'agents']
 
 const MODES = ['minimal', 'standard', 'ptc', 'team', 'creator']
-const VALID_AGENT_PRESETS = ['standard', 'ptc', 'minimal', 'cordis']
+const VALID_AGENT_PRESETS = ['standard', 'ptc', 'minimal', 'cordis', 'team']
 const REQUEST_DIR = join(homedir(), '.dsh', 'mode-router')
 const REQUEST_FILE = join(REQUEST_DIR, 'request.json')
 const STATE_FILE = join(REQUEST_DIR, 'state.json')
@@ -109,69 +109,51 @@ export function apply(ctx) {
       const rawAgentId = initiator?.id || exec?.agent?.id || exec?.agent?.session?.id || null
       const sessionId = resolveActiveSessionId(rawAgentId)
       const targetPreset = mode === 'creator' ? 'cordis' : mode
-      const safeAgentPreset = VALID_AGENT_PRESETS.includes(targetPreset) ? targetPreset : 'standard'
+      const safeFallbackPreset = ['standard', 'ptc', 'minimal', 'cordis'].includes(targetPreset) ? targetPreset : 'standard'
       const currentState = readCurrentState()
       const session = initiator?.session || exec?.agent?.session
 
       const presets = ctx.agentPresets || (ctx.get ? ctx.get('agentPresets') : null)
       const agentCtx = initiator?.ctx || exec?.agent?.ctx
       let presetRecorded = false
-      const recordSafePreset = () => {
+      const recordPreset = (presetId) => {
         if (presetRecorded || !session?.append) return
         try {
-          session.append('agent-preset/selected', { agentPreset: safeAgentPreset })
+          session.append('agent-preset/selected', { agentPreset: presetId })
           presetRecorded = true
         } catch { /* el registro es best-effort */ }
       }
 
-      // 1. Modos con preset nativo DSH (standard, ptc, minimal, cordis)
-      if (VALID_AGENT_PRESETS.includes(targetPreset)) {
-        const needsSupervisorResetFromTeam = mode === 'standard' && currentState?.mode === 'team'
-        if (presets && agentCtx) {
-          try {
-            await presets.recompose(agentCtx, safeAgentPreset)
-            recordSafePreset()
-            if (!needsSupervisorResetFromTeam) {
-              return {
-                status: 'accepted',
-                mode,
-                message:
-                  `[MODO AISLADO]: Esta sesión ha cambiado a '${mode}' en memoria de forma instantánea. ` +
-                  `El servidor dsh web NO se ha reiniciado y todos tus demás proyectos permanecen 100% intactos en sus propios motores. ` +
-                  `Motivo: ${reason.trim()}`
-              }
+      // 1. Conmutación 100% aislada por sesión en memoria para los 5 modos (standard, ptc, minimal, cordis, team)
+      if (presets && agentCtx && VALID_AGENT_PRESETS.includes(targetPreset)) {
+        try {
+          await presets.recompose(agentCtx, targetPreset)
+          recordPreset(targetPreset)
+          const hasLegacySupervisorOverlay = Boolean(
+            currentState?.mode && currentState.mode !== 'standard' && currentState.pid === process.pid
+          )
+          if (!hasLegacySupervisorOverlay) {
+            return {
+              status: 'accepted',
+              mode,
+              message:
+                `[MODO AISLADO]: Esta sesión ha cambiado a '${mode}' en memoria de forma instantánea. ` +
+                `El servidor dsh web NO se ha reiniciado y todos tus demás proyectos permanecen 100% intactos en sus propios motores. ` +
+                `Motivo: ${reason.trim()}`
             }
-          } catch {
-            // Si recompose falla, continúa al supervisor sin bloquear
           }
-        }
-      } else if (mode === 'team') {
-        // `team` es un overlay de supervisor, NUNCA un agentPreset de DSH.
-        // Recompone/registra la sesión en 'standard' para que reanude siempre sin errores.
-        if (presets && agentCtx) {
-          try {
-            await presets.recompose(agentCtx, 'standard')
-          } catch { /* best-effort antes del overlay o reutilización */ }
-        }
-        recordSafePreset()
-        if (currentState?.mode === 'team' && currentState?.pid === process.pid) {
-          return {
-            status: 'accepted',
-            mode: 'team',
-            message:
-              `[MODO TEAM ACTIVO]: El motor 'team' ya está cargado en este proceso y esta sesión ` +
-              `ha quedado lista con sus herramientas base estándar y agent-team sin reiniciar el servidor. ` +
-              `Motivo: ${reason.trim()}`
-          }
+        } catch {
+          // Si recompose falla (p. ej. preset aún no cargado), continúa al supervisor con fallback seguro
         }
       }
 
-      // 2. Conmutación vía supervisor (para team y restauración a standard desde team, o fallback)
-      // Registra SIEMPRE safeAgentPreset (nunca 'team') para proteger la reanudación en frío.
-      recordSafePreset()
+      // 2. Normalización del supervisor a 'standard' (o fallback si falló recompose)
+      // Si recompose tuvo éxito arriba, presetRecorded ya es true; si falló, se guarda safeFallbackPreset (nunca un preset inexistente).
+      recordPreset(safeFallbackPreset)
+      const supervisorMode = presetRecorded ? 'standard' : mode
       mkdirSync(REQUEST_DIR, { recursive: true })
       const request = {
-        mode,
+        mode: supervisorMode,
         reason: reason.trim(),
         sessionId: sessionId || 'desconocida',
         at: new Date().toISOString(),
@@ -184,8 +166,8 @@ export function apply(ctx) {
         status: 'accepted',
         mode,
         message:
-          `Cambio a '${mode}' iniciado. El supervisor reconfigurará el motor (~1.5s) y ` +
-          `DESPERTARÁ automáticamente esta sesión. Motivo: ${request.reason}`,
+          `Cambio a '${mode}' aplicado y normalizando supervisor a '${supervisorMode}' (~1.5s) con Auto-Wakeup. ` +
+          `Motivo: ${request.reason}`,
       }
     },
   }), 'switch-mode-tool: switch_mode')

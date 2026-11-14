@@ -497,12 +497,8 @@ def group_projects(rows, titles):
 
 
 def real_mode(row, engine_mode, target_sid="", engine_at_ms=0):
-    """Modo REAL de la sesion: refleja 'team' si el motor global esta en 'team'
-    y la sesion fue la que lo activo, o su ultimo preset real ('standard', 'ptc', 'minimal', 'creator')."""
-    rid = str(row.get("id") or "")
-    if engine_mode == "team":
-        if (target_sid and rid == target_sid) or row.get("last_switch") == "team":
-            return "team"
+    """Modo REAL de la sesion: su propio preset registrado ('standard', 'ptc', 'minimal', 'creator', 'team').
+    Cada sesion esta aislada en memoria con independencia de las demas."""
     return row.get("preset") or "standard"
 def order_rows(rows):
     for row in rows:
