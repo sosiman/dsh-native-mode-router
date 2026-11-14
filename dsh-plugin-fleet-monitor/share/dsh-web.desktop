@@ -1,0 +1,19 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DSH Web
+Comment=Open DeepSeek Harness Web UI (managed by dsh-supervisor)
+Exec=/usr/local/bin/dsh-open
+Icon=dsh-web
+Terminal=false
+Categories=Development;
+StartupNotify=false
+Actions=Monitor;Restart;
+
+[Desktop Action Monitor]
+Name=Open Fleet Monitor (dsh-top)
+Exec=x-terminal-emulator -e /usr/local/bin/dsh-top
+
+[Desktop Action Restart]
+Name=Restart DSH Supervisor
+Exec=/usr/local/bin/dsh-open --restart

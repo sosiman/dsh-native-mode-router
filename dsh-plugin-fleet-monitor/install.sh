@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Instalador idempotente de dsh-plugin-fleet-monitor en un perfil de DSH.
 #
-#   bash install.sh                 # instala en el perfil web (copia) + dsh-top
+#   bash install.sh                 # instala en el perfil web (copia) + dsh-top + dsh-open
 #   bash install.sh --link          # enlaza en vez de copiar (modo desarrollo)
 #   bash install.sh --profile acp   # otro perfil
-#   bash install.sh --no-bin        # no toca /usr/local/bin/dsh-top
+#   bash install.sh --no-bin        # no toca /usr/local/bin/{dsh-top,dsh-open}
+#   bash install.sh --desktop       # instala entrada de menu ~/.local/share/applications/dsh-web.desktop
 #   bash install.sh --check         # solo comprueba el estado
 #
 # Copiar (no enlazar) es lo recomendado: asi el plugin sobrevive a cambios en la
@@ -16,6 +17,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="web"
 MODE="copy"
 INSTALL_BIN=1
+INSTALL_DESKTOP=0
 CHECK_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -24,8 +26,9 @@ while [ $# -gt 0 ]; do
     --copy) MODE="copy"; shift ;;
     --profile) PROFILE="${2:?falta el nombre del perfil}"; shift 2 ;;
     --no-bin) INSTALL_BIN=0; shift ;;
+    --desktop) INSTALL_DESKTOP=1; shift ;;
     --check) CHECK_ONLY=1; shift ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "opcion desconocida: $1" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +66,12 @@ check() {
     say "dsh-top:       $(command -v dsh-top)"
   else
     say "dsh-top:       AUSENTE (se instala en /usr/local/bin)"
+    fail=1
+  fi
+  if command -v dsh-open >/dev/null 2>&1; then
+    say "dsh-open:      $(command -v dsh-open)"
+  else
+    say "dsh-open:      AUSENTE (se instala en /usr/local/bin)"
     fail=1
   fi
   if curl -s -m 3 http://127.0.0.1:3080/__dsh_fleet/status >/dev/null 2>&1; then
@@ -112,16 +121,37 @@ else
   say "cordis.patch.yml: entrada '$ENTRY_ID' anadida"
 fi
 
-if [ "$INSTALL_BIN" = "1" ]; then
+install_usr_bin() {
+  local src="$1"
+  local name="$2"
   if [ "$(id -u)" = "0" ]; then
-    install -m 755 "$SRC/bin/dsh-top" /usr/local/bin/dsh-top
+    install -m 755 "$src" "/usr/local/bin/$name"
+    say "$name instalado en /usr/local/bin/$name"
   elif sudo -n true 2>/dev/null; then
-    sudo -n install -m 755 "$SRC/bin/dsh-top" /usr/local/bin/dsh-top
+    sudo -n install -m 755 "$src" "/usr/local/bin/$name"
+    say "$name instalado en /usr/local/bin/$name"
   else
-    say "AVISO: sin sudo no puedo instalar /usr/local/bin/dsh-top." >&2
-    say "       ejecuta: sudo install -m 755 '$SRC/bin/dsh-top' /usr/local/bin/dsh-top" >&2
+    say "AVISO: sin sudo no puedo instalar /usr/local/bin/$name." >&2
+    say "       ejecuta: sudo install -m 755 '$src' '/usr/local/bin/$name'" >&2
   fi
-  say "dsh-top instalado en /usr/local/bin/dsh-top"
+}
+
+if [ "$INSTALL_BIN" = "1" ]; then
+  install_usr_bin "$SRC/bin/dsh-top" dsh-top
+  install_usr_bin "$SRC/bin/dsh-open" dsh-open
+fi
+
+if [ "$INSTALL_DESKTOP" = "1" ] && [ -f "$SRC/share/dsh-web.desktop" ]; then
+  APP_DIR="$HOME/.local/share/applications"
+  ICON_DIR="$HOME/.local/share/icons/hicolor/512x512/apps"
+  mkdir -p "$APP_DIR" "$ICON_DIR"
+  ICON_SRC="$(node -e "try{console.log(require('path').join(require('path').dirname(require.resolve('@deepseek-ai/dsh-web-frontend/package.json')),'dist','icon-512.png'))}catch{}" 2>/dev/null || true)"
+  if [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ]; then
+    cp -f "$ICON_SRC" "$ICON_DIR/dsh-web.png"
+  fi
+  install -m 755 "$SRC/share/dsh-web.desktop" "$APP_DIR/dsh-web.desktop"
+  update-desktop-database "$APP_DIR" 2>/dev/null || true
+  say "entrada de menu instalada en $APP_DIR/dsh-web.desktop"
 fi
 
 say
@@ -129,6 +159,7 @@ say "== comprobaciones de sintaxis =="
 node --check "$SRC/lib/index.js" && say "  host OK"
 node --check "$SRC/lib/client.js" && say "  cliente OK"
 python3 -m py_compile "$SRC/bin/dsh-top" && say "  dsh-top OK"
+bash -n "$SRC/bin/dsh-open" && say "  dsh-open OK"
 
 say
 say "== siguiente paso =="

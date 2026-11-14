@@ -73,7 +73,10 @@ dsh-native-mode-router/
     │   ├── index.js               # Host endpoints: /__dsh_fleet/status, /wake, /launch-terminal
     │   └── client.js              # Web frontend tab: Settings > Plugins > DSH Fleet Monitor
     ├── bin/
-    │   └── dsh-top                # Standalone curses-like real-time fleet monitor CLI (with real_mode resolution)
+    │   ├── dsh-top                # Standalone curses-like real-time fleet monitor CLI (with real_mode resolution)
+    │   └── dsh-open               # User launcher: opens active DSH Web URL with token in browser (avoids EADDRINUSE)
+    ├── share/
+    │   └── dsh-web.desktop        # Optional desktop/menu entry calling dsh-open
     └── package.json
 ```
 
@@ -177,14 +180,26 @@ systemctl --user restart dsh-supervisor.service
 
 ---
 
-## 6. Duplicate Tab Protection (`--no-open`)
+## 6. Opening the Web UI (`dsh-open`) & Duplicate Tab Protection (`--no-open`)
 
-When `dsh web` boots without `--no-open`, it calls the OS default browser launcher (`xdg-open` / Google Chrome) on every boot. Because mode switches reload DSH, this previously opened a new tab on every switch.
+When `dsh web` boots without `--no-open`, it calls the OS default browser launcher on every boot. Because mode switches reload DSH, this previously opened a new tab on every switch.
 
-Enforcing `['web', '--patch', patch, '--no-open']` ensures:
+Enforcing `['web', '--patch', patch, '--no-open']` in `supervisor.mjs` ensures:
 - DSH Web starts silently on `http://127.0.0.1:3080`.
 - Existing open browser tabs automatically reconnect their WebSocket.
 - Exactly zero unwanted tabs are spawned.
+
+Because `dsh-supervisor.service` already owns port `3080` in the background, running `dsh web` manually fails with `listen EADDRINUSE: address already in use 127.0.0.1:3080`. Instead, use the companion launcher **`dsh-open`** (installed to `/usr/local/bin/dsh-open` by `dsh-plugin-fleet-monitor/install.sh`):
+
+```bash
+dsh-open              # Ensure supervisor is running and open the active token URL in your browser
+dsh-open --url        # Print the active authenticated URL without launching a browser
+dsh-open --status     # Check dsh-supervisor.service status
+dsh-open --restart    # Restart dsh-supervisor.service and open the fresh URL
+```
+
+> [!TIP]
+> Once opened once with `?token=...`, DSH issues a persistent signed `HttpOnly` cookie valid for 30 days (`cookieMaxAgeDays: 30`), allowing `http://127.0.0.1:3080/` to work across reboots and mode switches in that browser. Pass `--desktop` to `dsh-plugin-fleet-monitor/install.sh` to install the application menu shortcut (`dsh-web.desktop`).
 
 ---
 

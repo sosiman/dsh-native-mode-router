@@ -20,6 +20,8 @@ dsh plugin modos             092e1755  🛠️ CREATOR    🟡 TODAY            
 | Host (cordis) | `lib/index.js` | Rutas `GET /__dsh_fleet/status` y `POST /__dsh_fleet/launch-terminal`. Averigua el entorno grafico real (DISPLAY/Wayland/XAUTHORITY) leyendo el proceso de escritorio y lanza la terminal. |
 | Cliente web | `lib/client.js` | Pestana en Ajustes ▸ Plugins, boton de lanzamiento y panel con motor actual, pid de DSH, sesiones en disco/activas, monitores abiertos y escritorio detectado. |
 | Monitor | `bin/dsh-top` | Programa Python que se instala en `/usr/local/bin/dsh-top`. |
+| Lanzador Web | `bin/dsh-open` | Script Bash que se instala en `/usr/local/bin/dsh-open`: abre la web con el token activo sin chocar en el puerto 3080. |
+| Acceso de menú | `share/dsh-web.desktop` | Entrada `.desktop` opcional (`install.sh --desktop`) para abrir DSH Web desde el menú/escritorio. |
 
 `dsh-top` no depende del host: se puede ejecutar a mano (`dsh-top`) en cualquier
 terminal. Lee solo la **cabecera** de cada `session.v3/v4.jsonl.zstd`, la cachea por
@@ -53,7 +55,8 @@ patch correspondiente.
 
 ```bash
 cd dsh-plugin-fleet-monitor
-bash install.sh            # copia el plugin al perfil web + deja /usr/local/bin/dsh-top
+bash install.sh            # copia el plugin al perfil web + deja /usr/local/bin/{dsh-top,dsh-open}
+bash install.sh --desktop  # además instala la entrada de menú ~/.local/share/applications/dsh-web.desktop
 bash install.sh --check    # solo comprueba el estado
 ```
 
@@ -61,6 +64,7 @@ bash install.sh --check    # solo comprueba el estado
   sigue necesitando reinicio).
 - `--profile acp` instala en otro perfil.
 - `--no-bin` no toca `/usr/local/bin`.
+- `--desktop` instala la entrada `dsh-web.desktop` y su icono en `~/.local/share/`.
 
 ### Recarga
 

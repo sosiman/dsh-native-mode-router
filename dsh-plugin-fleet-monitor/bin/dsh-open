@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# dsh-open — User launcher for DeepSeek Harness Web UI under dsh-supervisor.service.
+# Reads the active authenticated URL from the current supervisor boot without touching `dsh`.
+set -euo pipefail
+
+DSH_HOME="${DSH_HOME:-${HOME}/.dsh}"
+DSH_PORT="${DSH_PORT:-3080}"
+SUPERVISOR_UNIT="${DSH_SUPERVISOR_UNIT:-dsh-supervisor.service}"
+SUPERVISOR_LOG="${DSH_HOME}/mode-router/supervisor.log"
+LAST_URL_FILE="${DSH_HOME}/mode-router/last-url.txt"
+STATUS_URL="http://127.0.0.1:${DSH_PORT}/__dsh_fleet/status"
+BASE_URL="http://127.0.0.1:${DSH_PORT}/"
+BROWSER="${DSH_BROWSER:-}"
+ACTION="open"
+
+show_help() {
+  cat <<'EOF'
+Usage: dsh-open [options]
+
+Open DeepSeek Harness Web UI using the active instance managed by
+dsh-supervisor.service without colliding on the listening port.
+
+Options:
+  --url, -u           Print the active authenticated URL and exit
+  --browser <cmd>     Browser binary to launch (defaults to xdg-open / firefox)
+  --status            Show systemd status of dsh-supervisor.service
+  --restart           Restart dsh-supervisor.service and open the fresh URL
+  -h, --help          Show this help message
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    --url|-u)
+      ACTION="url"
+      shift
+      ;;
+    --status)
+      ACTION="status"
+      shift
+      ;;
+    --restart)
+      ACTION="restart"
+      shift
+      ;;
+    --browser)
+      BROWSER="${2:?missing browser command after --browser}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      show_help >&2
+      exit 2
+      ;;
+  esac
+done
+
+is_alive() {
+  curl -sf -m 1 "$STATUS_URL" >/dev/null 2>&1 \
+    || (exec 3<>"/dev/tcp/127.0.0.1/${DSH_PORT}") 2>/dev/null
+}
+
+wait_ready() {
+  local i
+  for i in $(seq 1 40); do
+    if is_alive; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+extract_boot_url() {
+  if [ -r "$SUPERVISOR_LOG" ]; then
+    local found
+    found="$(awk -v port="$DSH_PORT" '
+      /arrancando motor/ { url = "" }
+      index($0, "dsh web: http://127.0.0.1:" port "/?token=") {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ ("^http://127\\.0\\.0\\.1:" port "/\\?token=[A-Za-z0-9_-]+$")) {
+            url = $i
+          }
+        }
+      }
+      END { if (url != "") print url }
+    ' "$SUPERVISOR_LOG" 2>/dev/null || true)"
+    if [ -n "$found" ]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
+  if [ -r "$LAST_URL_FILE" ]; then
+    head -n 1 "$LAST_URL_FILE" 2>/dev/null || true
+  fi
+}
+
+get_active_url() {
+  local url=""
+  local i
+  for i in $(seq 1 20); do
+    url="$(extract_boot_url)"
+    if [ -n "$url" ] || [ ! -r "$SUPERVISOR_LOG" ]; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$url" ]; then
+    url="$BASE_URL"
+  fi
+  printf '%s\n' "$url"
+}
+
+ensure_running() {
+  if is_alive; then
+    return 0
+  fi
+  echo "Starting ${SUPERVISOR_UNIT}..."
+  systemctl --user start "$SUPERVISOR_UNIT"
+  if ! wait_ready; then
+    echo "Error: DSH Web did not respond on port ${DSH_PORT}. Check ${SUPERVISOR_LOG}" >&2
+    exit 1
+  fi
+}
+
+resolve_browser() {
+  if [ -n "$BROWSER" ]; then
+    if command -v "$BROWSER" >/dev/null 2>&1; then
+      printf '%s\n' "$BROWSER"
+      return 0
+    fi
+    echo "Error: browser '${BROWSER}' not found in PATH." >&2
+    exit 1
+  fi
+  local candidate
+  for candidate in xdg-open firefox google-chrome chromium chromium-browser; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+open_browser() {
+  local url="$1"
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "No graphical session detected. Open this URL in your browser:"
+    echo "  $url"
+    exit 0
+  fi
+
+  local launcher
+  if ! launcher="$(resolve_browser)"; then
+    echo "Error: no browser or xdg-open found. Open manually: $url" >&2
+    exit 1
+  fi
+
+  echo "Opening DSH Web in ${launcher}: ${url}"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$launcher" "$url" >/dev/null 2>&1 </dev/null
+  else
+    nohup "$launcher" "$url" >/dev/null 2>&1 </dev/null &
+  fi
+}
+
+case "$ACTION" in
+  status)
+    systemctl --user status "$SUPERVISOR_UNIT" --no-pager
+    ;;
+  url)
+    ensure_running
+    get_active_url
+    ;;
+  restart)
+    echo "Restarting ${SUPERVISOR_UNIT}..."
+    systemctl --user restart "$SUPERVISOR_UNIT"
+    if ! wait_ready; then
+      echo "Error: DSH Web did not respond after restart. Check ${SUPERVISOR_LOG}" >&2
+      exit 1
+    fi
+    open_browser "$(get_active_url)"
+    ;;
+  open)
+    ensure_running
+    open_browser "$(get_active_url)"
+    ;;
+esac
